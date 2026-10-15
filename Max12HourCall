@@ -1,33 +1,40 @@
 import xapi from 'xapi';
 
-// 12 hours converted to milliseconds (12 * 60 * 60 * 1000)
-const MAX_CALL_DURATION_MS = 43200000; 
-const CHECK_INTERVAL_MS = 60000; // Check every 1 minute
+// Time thresholds (in seconds)
+const MAX_CALL_DURATION_SECONDS = 43200;              // 12 hours
+const WARNING_THRESHOLD_SECONDS = 42900;              // 11 hours, 55 minutes (5 min warning)
+const CHECK_INTERVAL_MS = 30000;                     // Check every 30 seconds for higher precision
 
+const WARNING_ALERT_ID = 'call_timeout_warning';
 let checkTimer = null;
+let extendedCalls = new Set(); // Tracks calls where the user clicked "Extend Call"
 
-// Function to check call duration and disconnect if over 12 hours
+// Function to check call duration and handle warnings/disconnections
 async function checkCallDuration() {
   try {
-    const sessions = await xapi.Status.RoomAnalytics.Call.get();
-    // Alternatively, fetch the primary active call status
     const calls = await xapi.Status.Call.get();
     
     if (calls && calls.length > 0) {
       for (const call of calls) {
-        // Only track active connected calls
-        if (call.Status === 'Connected') {
-          // If the system doesn't expose the start timestamp in the active call status, 
-          // RoomOS tracks duration via the structural call object or you can record it locally.
-          const duration = await xapi.Status.Call[call.id].Duration.get(); 
+        if (call.Status === 'Connected' && call.Duration) {
+          let durationSeconds = parseInt(call.Duration, 10);
           
-          // Duration is often returned in seconds by the xAPI
-          const durationSeconds = parseInt(duration, 10);
-          const maxSeconds = 12 * 3600;
+          // If the user extended this specific call, subtract 12 hours from the calculated duration
+          if (extendedCalls.has(call.id)) {
+            durationSeconds -= MAX_CALL_DURATION_SECONDS;
+          }
 
-          if (durationSeconds >= maxSeconds) {
-            console.log(`[Macro] Call ${call.id} exceeded 12 hours (${durationSeconds}s). Disconnecting...`);
+          // 1. Disconnect condition
+          if (durationSeconds >= MAX_CALL_DURATION_SECONDS) {
+            console.log(`[Macro] Call ${call.id} reached maximum duration. Disconnecting...`);
+            // Clear any lingering warning UI
+            xapi.Command.UserInterface.Message.Prompt.Clear({ FeedbackId: WARNING_ALERT_ID });
             xapi.Command.Call.Disconnect({ CallId: call.id });
+          } 
+          // 2. Warning condition
+          else if (durationSeconds >= WARNING_THRESHOLD_SECONDS) {
+            console.log(`[Macro] Call ${call.id} approaching 12 hours (${durationSeconds}s). Displaying prompt.`);
+            showWarningPrompt(call.id);
           }
         }
       }
@@ -37,28 +44,66 @@ async function checkCallDuration() {
   }
 }
 
-// Start tracking when a call connects
-xapi.Status.Call.on((callEvent) => {
-  if (callEvent.Status === 'Connected') {
-    if (!checkTimer) {
-      console.log('[Macro] Call connected. Starting 12-hour limit watchdog.');
-      checkTimer = setInterval(checkCallDuration, CHECK_INTERVAL_MS);
+// Function to display the on-screen alert prompt
+function showWarningPrompt(callId) {
+  xapi.Command.UserInterface.Message.Prompt.Display({
+    Title: 'Maximum Call Duration Approaching',
+    Text: 'This call has been active for nearly 12 hours. It will automatically disconnect in 5 minutes to optimize room resources.',
+    FeedbackId: WARNING_ALERT_ID,
+    'Option.1': 'Extend Call (12h)',
+    'Option.2': 'Dismiss'
+  }).catch((err) => console.error('[Macro] Error displaying prompt:', err));
+}
+
+// Listen for the user's interaction with the prompt
+xapi.Event.UserInterface.Message.Prompt.Response.on((event) => {
+  if (event.FeedbackId === WARNING_ALERT_ID) {
+    if (event.OptionId === '1') {
+      console.log('[Macro] User elected to extend the call.');
+      
+      // Fetch active calls to find out which call ID to whitelist/extend
+      xapi.Status.Call.get().then((calls) => {
+        if (calls && calls.length > 0) {
+          // Add the first active connected call to the extended list
+          const activeCall = calls.find(c => c.Status === 'Connected');
+          if (activeCall) {
+            extendedCalls.add(activeCall.id);
+          }
+        }
+      });
+
+      // Clear the prompt immediately
+      xapi.Command.UserInterface.Message.Prompt.Clear({ FeedbackId: WARNING_ALERT_ID });
+    } else if (event.OptionId === '2') {
+      console.log('[Macro] User dismissed the warning. Call will drop at 12 hours.');
     }
   }
 });
 
-// Clean up the timer when no calls are active
-xapi.Status.Call.on((callEvent) => {
-  if (callEvent.Status === 'Idle' || callEvent.Status === 'Disconnecting') {
-    // Double check if any other call legs exist
-    xapi.Status.Call.get().then((calls) => {
-      if (!calls || calls.length === 0) {
-        if (checkTimer) {
-          console.log('[Macro] All calls cleared. Stopping watchdog.');
-          clearInterval(checkTimer);
-          checkTimer = null;
-        }
+// Watchdog manager to start/stop the loop based on call availability
+function manageWatchdog() {
+  xapi.Status.Call.get().then((calls) => {
+    const activeCalls = calls ? calls.filter(c => c.Status === 'Connected') : [];
+    
+    if (activeCalls.length > 0) {
+      if (!checkTimer) {
+        console.log('[Macro] Active call detected. Starting 12-hour limit watchdog.');
+        checkTimer = setInterval(checkCallDuration, CHECK_INTERVAL_MS);
+        checkCallDuration(); 
       }
-    });
-  }
-});
+    } else {
+      if (checkTimer) {
+        console.log('[Macro] No active calls. Stopping watchdog and clearing memory.');
+        clearInterval(checkTimer);
+        checkTimer = null;
+        extendedCalls.clear(); // Reset extension memory for the next session
+        xapi.Command.UserInterface.Message.Prompt.Clear({ FeedbackId: WARNING_ALERT_ID });
+      }
+    }
+  }).catch((err) => {
+    console.error('[Macro] Error getting calls in watchdog manager:', err);
+  });
+}
+
+// Listen for any call status changes to prompt a watchdog check
+xapi.Status.Call.on(manageWatchdog);
