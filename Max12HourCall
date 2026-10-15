@@ -1,0 +1,64 @@
+import xapi from 'xapi';
+
+// 12 hours converted to milliseconds (12 * 60 * 60 * 1000)
+const MAX_CALL_DURATION_MS = 43200000; 
+const CHECK_INTERVAL_MS = 60000; // Check every 1 minute
+
+let checkTimer = null;
+
+// Function to check call duration and disconnect if over 12 hours
+async function checkCallDuration() {
+  try {
+    const sessions = await xapi.Status.RoomAnalytics.Call.get();
+    // Alternatively, fetch the primary active call status
+    const calls = await xapi.Status.Call.get();
+    
+    if (calls && calls.length > 0) {
+      for (const call of calls) {
+        // Only track active connected calls
+        if (call.Status === 'Connected') {
+          // If the system doesn't expose the start timestamp in the active call status, 
+          // RoomOS tracks duration via the structural call object or you can record it locally.
+          const duration = await xapi.Status.Call[call.id].Duration.get(); 
+          
+          // Duration is often returned in seconds by the xAPI
+          const durationSeconds = parseInt(duration, 10);
+          const maxSeconds = 12 * 3600;
+
+          if (durationSeconds >= maxSeconds) {
+            console.log(`[Macro] Call ${call.id} exceeded 12 hours (${durationSeconds}s). Disconnecting...`);
+            xapi.Command.Call.Disconnect({ CallId: call.id });
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('[Macro] Error evaluating call durations:', error);
+  }
+}
+
+// Start tracking when a call connects
+xapi.Status.Call.on((callEvent) => {
+  if (callEvent.Status === 'Connected') {
+    if (!checkTimer) {
+      console.log('[Macro] Call connected. Starting 12-hour limit watchdog.');
+      checkTimer = setInterval(checkCallDuration, CHECK_INTERVAL_MS);
+    }
+  }
+});
+
+// Clean up the timer when no calls are active
+xapi.Status.Call.on((callEvent) => {
+  if (callEvent.Status === 'Idle' || callEvent.Status === 'Disconnecting') {
+    // Double check if any other call legs exist
+    xapi.Status.Call.get().then((calls) => {
+      if (!calls || calls.length === 0) {
+        if (checkTimer) {
+          console.log('[Macro] All calls cleared. Stopping watchdog.');
+          clearInterval(checkTimer);
+          checkTimer = null;
+        }
+      }
+    });
+  }
+});
